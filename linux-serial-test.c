@@ -14,6 +14,9 @@
 #include <time.h>
 #include <linux/serial.h>
 #include <errno.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <sched.h>
 
 // command line args
 int _cl_baud = 0;
@@ -24,8 +27,6 @@ int _cl_rx_dump_ascii = 0;
 int _cl_tx_detailed = 0;
 int _cl_stats = 0;
 int _cl_stop_on_error = 0;
-int _cl_single_byte = -1;
-int _cl_another_byte = -1;
 int _cl_rts_cts = 0;
 int _cl_2_stop_bit = 0;
 int _cl_parity = 0;
@@ -53,6 +54,19 @@ int _write_count = 0;
 int _read_count = 0;
 int _error_count = 0;
 
+int _write_count_2 = 0;
+int _read_count_2 = 0;
+
+// Threading
+pthread_t read_thread;
+pthread_t write_thread;
+pthread_t stats_thread;
+sem_t _sem_stats;
+
+void *read_thread_fn(void *);
+void *write_thread_fn(void *);
+void *stats_thread_fn(void *);
+
 void dump_data(unsigned char * b, int count) {
 	printf("%i bytes: ", count);
 	int i;
@@ -67,33 +81,6 @@ void dump_data_ascii(unsigned char * b, int count) {
 	int i;
 	for (i=0; i < count; i++) {
 		printf("%c", b[i]);
-	}
-}
-
-void set_baud_divisor(int speed)
-{
-	// default baud was not found, so try to set a custom divisor
-	struct serial_struct ss;
-	if (ioctl(_fd, TIOCGSERIAL, &ss) != 0) {
-		printf("TIOCGSERIAL failed\n");
-		exit(1);
-	}
-
-	ss.flags = (ss.flags & ~ASYNC_SPD_MASK) | ASYNC_SPD_CUST;
-	ss.custom_divisor = (ss.baud_base + (speed/2)) / speed;
-	int closest_speed = ss.baud_base / ss.custom_divisor;
-
-	if (closest_speed < speed * 98 / 100 || closest_speed > speed * 102 / 100) {
-		printf("Cannot set speed to %d, closest is %d\n", speed, closest_speed);
-		exit(1);
-	}
-
-	printf("closest baud = %i, base = %i, divisor = %i\n", closest_speed, ss.baud_base,
-			ss.custom_divisor);
-
-	if (ioctl(_fd, TIOCSSERIAL, &ss) < 0) {
-		printf("TIOCSSERIAL failed\n");
-		exit(1);
 	}
 }
 
@@ -181,7 +168,7 @@ void process_options(int argc, char * argv[])
 {
 	for (;;) {
 		int option_index = 0;
-		static const char *short_options = "hb:p:d:R:TsSy:z:cBertq:l:a:w:o:i:P:";
+		static const char *short_options = "hb:p:d:R:TsScBertq:l:a:w:o:i:P:";
 		static const struct option long_options[] = {
 			{"help", no_argument, 0, 0},
 			{"baud", required_argument, 0, 'b'},
@@ -191,8 +178,6 @@ void process_options(int argc, char * argv[])
 			{"detailed_tx", no_argument, 0, 'T'},
 			{"stats", no_argument, 0, 's'},
 			{"stop-on-err", no_argument, 0, 'S'},
-			{"single-byte", no_argument, 0, 'y'},
-			{"second-byte", no_argument, 0, 'z'},
 			{"rts-cts", no_argument, 0, 'c'},
 			{"2-stop-bit", no_argument, 0, 'B'},
 			{"parity", required_argument, 0, 'P'},
@@ -244,16 +229,6 @@ void process_options(int argc, char * argv[])
 		case 'S':
 			_cl_stop_on_error = 1;
 			break;
-		case 'y': {
-			char * endptr;
-			_cl_single_byte = strtol(optarg, &endptr, 0);
-			break;
-		}
-		case 'z': {
-			char * endptr;
-			_cl_another_byte = strtol(optarg, &endptr, 0);
-			break;
-		}
 		case 'c':
 			_cl_rts_cts = 1;
 			break;
@@ -310,21 +285,26 @@ void process_options(int argc, char * argv[])
 
 void dump_serial_port_stats()
 {
+	sem_wait(&_sem_stats);
 	struct serial_icounter_struct icount = { 0 };
 
-	printf("%s: count for this session: rx=%i, tx=%i, rx err=%i\n", _cl_port, _read_count, _write_count, _error_count);
+	printf("%s: count for this session: total_rx=%i, rx_rate=%i, total_tx=%i, tx_rate=%i, rx err=%i\n", _cl_port, _read_count, _read_count_2, _write_count, _write_count_2, _error_count);
 
-	int ret = ioctl(_fd, TIOCGICOUNT, &icount);
-	if (ret != -1) {
-		printf("%s: TIOCGICOUNT: ret=%i, rx=%i, tx=%i, frame = %i, overrun = %i, parity = %i, brk = %i, buf_overrun = %i\n",
-				_cl_port, ret, icount.rx, icount.tx, icount.frame, icount.overrun, icount.parity, icount.brk,
-				icount.buf_overrun);
-	}
+	/* int ret = ioctl(_fd, TIOCGICOUNT, &icount); */
+	/* if (ret != -1) { */
+	/*	printf("%s: TIOCGICOUNT: ret=%i, rx=%i, tx=%i, frame = %i, overrun = %i, parity = %i, brk = %i, buf_overrun = %i\n", */
+	/*			_cl_port, ret, icount.rx, icount.tx, icount.frame, icount.overrun, icount.parity, icount.brk, */
+	/*			icount.buf_overrun); */
+	/* } */
+
+	_write_count_2 = 0;
+	_read_count_2 = 0;
+	sem_post(&_sem_stats);
 }
 
 void process_read_data()
 {
-	unsigned char rb[1024];
+	unsigned char rb[2*1024];
 	int c = read(_fd, &rb, sizeof(rb));
 	if (c > 0) {
 		if (_cl_rx_dump) {
@@ -334,15 +314,21 @@ void process_read_data()
 				dump_data(rb, c);
 		}
 
-		// verify read count is incrementing
 		int i;
+		int err = 0;
+
+		// verify read count is incrementing
 		for (i = 0; i < c; i++) {
 			if (rb[i] != _read_count_value) {
 				if (_cl_dump_err) {
+					sem_wait(&_sem_stats);
 					printf("Error, count: %i, expected %02x, got %02x\n",
 							_read_count + i, _read_count_value, rb[i]);
+					sem_post(&_sem_stats);
 				}
-				_error_count++;
+
+				err++;
+
 				if (_cl_stop_on_error) {
 					dump_serial_port_stats();
 					exit(1);
@@ -351,8 +337,16 @@ void process_read_data()
 			}
 			_read_count_value++;
 		}
+
+		sem_wait(&_sem_stats);
 		_read_count += c;
+		_read_count_2 += c;
+		_error_count += err;
+		sem_post(&_sem_stats);
 	}
+
+	if (_cl_tx_detailed)
+		printf("read %d bytes\n", c);
 }
 
 void process_write_data()
@@ -383,7 +377,10 @@ void process_write_data()
 		}
 	} while (repeat);
 
+	sem_wait(&_sem_stats);
 	_write_count += count;
+	_write_count_2 += count;
+	sem_post(&_sem_stats);
 
 	if (_cl_tx_detailed)
 		printf("wrote %zd bytes\n", count);
@@ -468,6 +465,136 @@ int diff_ms(const struct timespec *t1, const struct timespec *t2)
 	return (diff.tv_sec * 1000 + diff.tv_nsec/1000000);
 }
 
+void *read_thread_fn(void *fd)
+{
+	struct pollfd serial_poll;
+
+	serial_poll.fd = (int) fd;
+
+	if (!_cl_no_rx) {
+		serial_poll.events |= POLLIN;
+	} else {
+		serial_poll.events &= ~POLLIN;
+	}
+
+	struct timespec last_read = { .tv_sec = 0, .tv_nsec = 0 };
+
+	struct timespec start_time;
+	clock_gettime(CLOCK_MONOTONIC, &start_time);
+
+	while (!_cl_no_rx) {
+		int retval = poll(&serial_poll, 1, 1000);
+
+		struct timespec current;
+		clock_gettime(CLOCK_MONOTONIC, &current);
+
+		if (retval == -1) {
+			perror("read - poll()");
+		} else if (retval) {
+
+			if (serial_poll.revents & POLLIN) {
+				if (_cl_rx_delay) {
+					// only read if it has been rx()-delay ms
+					// since the last read
+					if (diff_ms(&current, &last_read) > _cl_rx_delay) {
+						process_read_data();
+						last_read = current;
+					}
+				} else {
+					process_read_data();
+				}
+			}
+		} else {
+			sem_wait(&_sem_stats);
+			if (_read_count == 0) {
+				printf("No data...\n");
+			}
+			sem_post(&_sem_stats);
+		}
+
+		if (_cl_rx_time) {
+			if (current.tv_sec - start_time.tv_sec >= _cl_rx_time) {
+				_cl_rx_time = 0;
+				_cl_no_rx = 1;
+				serial_poll.events &= ~POLLIN;
+				printf("Stopped receiving.\n");
+			}
+		}
+
+	}
+}
+
+void *write_thread_fn(void *fd)
+{
+	struct pollfd serial_poll;
+
+	serial_poll.fd = (int) fd;
+
+	if (!_cl_no_tx) {
+		serial_poll.events |= POLLOUT;
+	} else {
+		serial_poll.events &= ~POLLOUT;
+	}
+
+	struct timespec last_write = { .tv_sec = 0, .tv_nsec = 0 };
+
+	struct timespec start_time;
+	clock_gettime(CLOCK_MONOTONIC, &start_time);
+
+	while (!_cl_no_tx) {
+		int retval = poll(&serial_poll, 1, 1000);
+
+		struct timespec current;
+		clock_gettime(CLOCK_MONOTONIC, &current);
+
+		if (retval == -1) {
+			perror("write - poll()");
+		} else if (retval) {
+
+			if (serial_poll.revents & POLLOUT) {
+				if (_cl_tx_delay) {
+					// only write if it has been tx()-delay ms
+					// since the last write
+					if (diff_ms(&current, &last_write) > _cl_tx_delay) {
+						process_write_data();
+						last_write = current;
+					}
+				} else {
+					process_write_data();
+				}
+			}
+		}
+
+		if (_cl_tx_time) {
+			if (current.tv_sec - start_time.tv_sec >= _cl_tx_time) {
+				_cl_tx_time = 0;
+				_cl_no_tx = 1;
+				serial_poll.events &= ~POLLOUT;
+				printf("Stopped transmitting.\n");
+			}
+		}
+
+	}
+}
+
+void *stats_thread_fn(void *param)
+{
+
+	struct timespec last_stat;
+
+	while (_cl_stats) {
+
+		struct timespec current;
+		clock_gettime(CLOCK_MONOTONIC, &current);
+
+			if (current.tv_sec - last_stat.tv_sec > 1) {
+				dump_serial_port_stats();
+				last_stat = current;
+			}
+	}
+
+}
+
 int main(int argc, char * argv[])
 {
 	printf("Linux serial test app\n");
@@ -481,29 +608,11 @@ int main(int argc, char * argv[])
 
 	int baud = B115200;
 
-	if (_cl_baud)
+	if (_cl_baud) {
 		baud = get_baud(_cl_baud);
-
-	if (baud <= 0) {
-		printf("NOTE: non standard baud rate, trying custom divisor\n");
-		baud = B38400;
-		setup_serial_port(B38400);
-		set_baud_divisor(_cl_baud);
-	} else {
-		setup_serial_port(baud);
 	}
 
-	if (_cl_single_byte >= 0) {
-		unsigned char data[2];
-		data[0] = (unsigned char)_cl_single_byte;
-		if (_cl_another_byte < 0) {
-			write(_fd, &data, 1);
-		} else {
-			data[1] = _cl_another_byte;
-			write(_fd, &data, 2);
-		}
-		return 0;
-	}
+	setup_serial_port(baud);
 
 	_write_size = (_cl_tx_bytes == 0) ? 1024 : _cl_tx_bytes;
 
@@ -512,98 +621,58 @@ int main(int argc, char * argv[])
 		printf("ERROR: Memory allocation failed\n");
 	}
 
-	struct pollfd serial_poll;
-	serial_poll.fd = _fd;
-	if (!_cl_no_rx) {
-		serial_poll.events |= POLLIN;
-	} else {
-		serial_poll.events &= ~POLLIN;
+	// Threading
+	struct sched_param read_param = { .sched_priority = 1 };
+	struct sched_param write_param = { .sched_priority = 2 };
+	struct sched_param stats_param = { .sched_priority = 3 };
+	pthread_attr_t read_attr;
+	pthread_attr_t write_attr;
+	pthread_attr_t stats_attr;
+
+	pthread_attr_init(&read_attr);
+	pthread_attr_init(&write_attr);
+	pthread_attr_init(&stats_attr);
+	if (pthread_attr_setschedpolicy(&read_attr, SCHED_FIFO) != 0
+			|| pthread_attr_setschedparam(&read_attr, &read_param) != 0) {
+		perror("pthread_attr");
+		exit(-1);
+	}
+	if (pthread_attr_setschedpolicy(&write_attr, SCHED_FIFO) != 0
+			 || pthread_attr_setschedparam(&write_attr, &write_param) != 0) {
+		perror("pthread_attr");
+		exit(-1);
+	}
+	if (pthread_attr_setschedpolicy(&stats_attr, SCHED_FIFO) != 0
+			|| pthread_attr_setschedparam(&stats_attr, &stats_param) != 0) {
+		perror("pthread_attr");
+		exit(-1);
 	}
 
-	if (!_cl_no_tx) {
-		serial_poll.events |= POLLOUT;
-	} else {
-		serial_poll.events &= ~POLLOUT;
+	sem_init(&_sem_stats, 0, 1);
+
+	int rc;
+	rc = pthread_create(&read_thread, &read_attr, read_thread_fn, _fd);
+	if (rc) {
+		perror("read - pthread_create()");
+		exit(-1);
 	}
 
-	struct timespec start_time, last_stat;
-	struct timespec last_read = { .tv_sec = 0, .tv_nsec = 0 };
-	struct timespec last_write = { .tv_sec = 0, .tv_nsec = 0 };
-
-	clock_gettime(CLOCK_MONOTONIC, &start_time);
-	last_stat = start_time;
-
-	while (!(_cl_no_rx && _cl_no_tx)) {
-		int retval = poll(&serial_poll, 1, 1000);
-
-		if (retval == -1) {
-			perror("poll()");
-		} else if (retval) {
-			if (serial_poll.revents & POLLIN) {
-				if (_cl_rx_delay) {
-					// only read if it has been rx-delay ms
-					// since the last read
-					struct timespec current;
-					clock_gettime(CLOCK_MONOTONIC, &current);
-					if (diff_ms(&current, &last_read) > _cl_rx_delay) {
-						process_read_data();
-						last_read = current;
-					}
-				} else {
-					process_read_data();
-				}
-			}
-
-			if (serial_poll.revents & POLLOUT) {
-				if (_cl_tx_delay) {
-					// only write if it has been tx-delay ms
-					// since the last write
-					struct timespec current;
-					clock_gettime(CLOCK_MONOTONIC, &current);
-					if (diff_ms(&current, &last_write) > _cl_tx_delay) {
-						process_write_data();
-						last_write = current;
-					}
-				} else {
-					process_write_data();
-				}
-			}
-		} else if (!(_cl_no_tx && _write_count != 0 && _write_count == _read_count)) {
-			// No data. We report this unless we are no longer
-			// transmitting and the receive count equals the
-			// transmit count, suggesting a loopback test that has
-			// finished.
-			printf("No data within one second.\n");
-		}
-
-		if (_cl_stats || _cl_tx_time || _cl_rx_time) {
-			struct timespec current;
-			clock_gettime(CLOCK_MONOTONIC, &current);
-
-			if (_cl_stats) {
-				if (current.tv_sec - last_stat.tv_sec > 5) {
-					dump_serial_port_stats();
-					last_stat = current;
-				}
-			}
-			if (_cl_tx_time) {
-				if (current.tv_sec - start_time.tv_sec >= _cl_tx_time) {
-					_cl_tx_time = 0;
-					_cl_no_tx = 1;
-					serial_poll.events &= ~POLLOUT;
-					printf("Stopped transmitting.\n");
-				}
-			}
-			if (_cl_rx_time) {
-				if (current.tv_sec - start_time.tv_sec >= _cl_rx_time) {
-					_cl_rx_time = 0;
-					_cl_no_rx = 1;
-					serial_poll.events &= ~POLLIN;
-					printf("Stopped receiving.\n");
-				}
-			}
-		}
+	rc = pthread_create(&write_thread, &write_attr, write_thread_fn, _fd);
+	if (rc) {
+		perror("write - pthread_create()");
+		exit(-1);
 	}
+
+	rc = pthread_create(&stats_thread, &stats_attr, stats_thread_fn, _fd);
+	if (rc) {
+		perror("stats - pthread_create()");
+		exit(-1);
+	}
+
+	pthread_attr_destroy(&read_attr);
+	pthread_attr_destroy(&write_attr);
+	pthread_attr_destroy(&stats_attr);
+	pthread_exit(NULL);
 
 	tcdrain(_fd);
 	dump_serial_port_stats();
