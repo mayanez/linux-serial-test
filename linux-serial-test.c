@@ -124,7 +124,7 @@ int get_baud(int baud)
 		return B3500000;
 	case 4000000:
 		return B4000000;
-	default: 
+	default:
 		return -1;
 	}
 }
@@ -150,8 +150,8 @@ void display_help()
 			"  -r, --no-rx       Don't receive data (can be used to test flow control)\n"
 			"                    when serial driver buffer is full\n"
 			"  -t, --no-tx       Don't transmit data\n"
-			"  -l, --rx-delay    Delay between reading data (ms) (can be used to test flow control)\n"
-			"  -a, --tx-delay    Delay between writing data (ms)\n"
+			"  -l, --rx-delay    Delay between reading data (us) (can be used to test flow control)\n"
+			"  -a, --tx-delay    Delay between writing data (us)\n"
 			"  -w, --tx-bytes    Number of bytes for each write (default is to repeatedly write 1024 bytes\n"
 			"                    until no more are accepted)\n"
 			"  -q, --rs485       Enable RS485 direction control on port, and set delay\n"
@@ -160,7 +160,7 @@ void display_help()
 			"  -o, --tx-time     Number of seconds to transmit for (defaults to 0, meaning no limit)\n"
 			"  -i, --rx-time     Number of seconds to receive for (defaults to 0, meaning no limit)\n"
 			"\n"
-	      );
+				);
 	exit(0);
 }
 
@@ -465,6 +465,19 @@ int diff_ms(const struct timespec *t1, const struct timespec *t2)
 	return (diff.tv_sec * 1000 + diff.tv_nsec/1000000);
 }
 
+int diff_us(const struct timespec *t1, const struct timespec *t2)
+{
+	struct timespec diff;
+
+	diff.tv_sec = t1->tv_sec - t2->tv_sec;
+	diff.tv_nsec = t1->tv_nsec - t2->tv_nsec;
+	if (diff.tv_nsec < 0) {
+		diff.tv_sec--;
+		diff.tv_nsec += 1000000000;
+	}
+	return (diff.tv_sec * 1000000 + diff.tv_nsec/1000);
+}
+
 void *read_thread_fn(void *fd)
 {
 	struct pollfd serial_poll;
@@ -496,7 +509,7 @@ void *read_thread_fn(void *fd)
 				if (_cl_rx_delay) {
 					// only read if it has been rx()-delay ms
 					// since the last read
-					if (diff_ms(&current, &last_read) > _cl_rx_delay) {
+					if (diff_us(&current, &last_read) > _cl_rx_delay) {
 						process_read_data();
 						last_read = current;
 					}
@@ -555,7 +568,7 @@ void *write_thread_fn(void *fd)
 				if (_cl_tx_delay) {
 					// only write if it has been tx()-delay ms
 					// since the last write
-					if (diff_ms(&current, &last_write) > _cl_tx_delay) {
+					if (diff_us(&current, &last_write) > _cl_tx_delay) {
 						process_write_data();
 						last_write = current;
 					}
